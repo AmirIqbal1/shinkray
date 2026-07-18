@@ -99,7 +99,3 @@ that matters to you, try a bigger `--size` first.
 ```bash
 rm ~/.local/bin/shrinkray
 ```
-
-## License
-
-MIT — see [LICENSE](LICENSE).
