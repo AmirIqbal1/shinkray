@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck-and-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg shellcheck
+
+      - name: Run ShellCheck
+        run: shellcheck install.sh shrinkray tests/smoke-test.sh
+
+      - name: Run smoke test
+        run: tests/smoke-test.sh

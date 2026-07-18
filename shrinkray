@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+#
+# shrinkray - point it at a video, get a much smaller one back.
+# https://github.com/AmirIqbal1/shinkray
+#
+set -euo pipefail
+
+VERSION="1.1.0"
+
+TARGET_MB=500
+QUALITY="good"
+CODEC="auto"
+CONTAINER="mkv"
+KEEP_ALL_AUDIO=false
+OUTPUT=""
+DRY_RUN=false
+FORCE=false
+BATCH_DIR=""
+RECURSIVE=false
+
+VIDEO_EXTS="mkv mp4 m4v avi mov wmv flv webm ts"
+AUDIO_KBPS=128
+ACTIVE_TEMP=""
+ACTIVE_WORKDIR=""
+
+say() { printf '==> %s\n' "$*"; }
+warn() { printf '!!  %s\n' "$*" >&2; }
+die() { printf 'xx  %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+shrinkray v${VERSION} - shrink a video file to a target size, safely.
+
+USAGE:
+  shrinkray <file> [options]
+  shrinkray --batch <directory> [--recursive] [options]
+  shrinkray doctor
+
+OPTIONS:
+  --size <MB>         Target output size in MB             (default: 500)
+  --quality <level>   fast | good | best                    (default: good)
+  --codec <name>      auto | hevc | av1                     (default: auto)
+                       auto uses HEVC; AV1 must be requested explicitly
+  --container <fmt>   mkv | mp4                              (default: mkv)
+  --keep-all-audio    Keep every audio track (default: first track only)
+  --output <path>     Output path (default: <name>.shrunk.<container>)
+  --batch <dir>       Process video files in a directory
+  --recursive         Include subdirectories in batch mode
+  --dry-run           Show what would happen without encoding
+  -y                  Replace an existing output without asking
+  -h, --help          Show this help
+  --version           Show version
+
+EXAMPLES:
+  shrinkray movie.mkv
+  shrinkray movie.mkv --size 700 --quality best
+  shrinkray --batch ~/Movies --recursive --size 500
+  shrinkray doctor
+EOF
+}
+
+cleanup_active() {
+  if [ -n "$ACTIVE_TEMP" ] && [ -e "$ACTIVE_TEMP" ]; then
+    rm -f -- "$ACTIVE_TEMP"
+  fi
+  if [ -n "$ACTIVE_WORKDIR" ] && [ -d "$ACTIVE_WORKDIR" ]; then
+    rm -rf -- "$ACTIVE_WORKDIR"
+  fi
+  ACTIVE_TEMP=""
+  ACTIVE_WORKDIR=""
+}
+
+handle_signal() {
+  local exit_code="$1"
+  warn "Encoding interrupted; removing the temporary output."
+  cleanup_active
+  trap - EXIT
+  exit "$exit_code"
+}
+
+trap cleanup_active EXIT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+
+need_bin() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed. Run install.sh first."
+}
+
+human_size_mb() {
+  local bytes="$1"
+  printf '%s\n' "$(( (bytes + 1048575) / 1048576 ))"
+}
+
+file_size_bytes() {
+  stat -c '%s' -- "$1"
+}
+
+is_video_file() {
+  local ext e
+  ext="${1##*.}"
+  ext="${ext,,}"
+  for e in $VIDEO_EXTS; do
+    [ "$ext" = "$e" ] && return 0
+  done
+  return 1
+}
+
+canonical_path() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m -- "$1"
+    return
+  fi
+
+  local dir base
+  dir="$(dirname -- "$1")"
+  base="$(basename -- "$1")"
+  dir="$(cd -- "$dir" && pwd -P)" || return 1
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+has_encoder() {
+  local encoder_list="$1"
+  local encoder="$2"
+  [[ "$encoder_list" == *"$encoder"* ]]
+}
+
+doctor() {
+  local self_path ffmpeg_line ffprobe_line encoder_list
+  if command -v realpath >/dev/null 2>&1; then
+    self_path="$(realpath -m -- "${BASH_SOURCE[0]}")"
+  else
+    self_path="${BASH_SOURCE[0]}"
+  fi
+
+  printf 'shrinkray doctor\n'
+  printf '  Version:      %s\n' "$VERSION"
+  printf '  Installation: %s\n' "$self_path"
+
+  if command -v ffmpeg >/dev/null 2>&1; then
+    ffmpeg_line="$(ffmpeg -version 2>/dev/null | sed -n '1p')"
+    printf '  ffmpeg:       %s (%s)\n' "${ffmpeg_line:-available}" "$(command -v ffmpeg)"
+    encoder_list="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+    if has_encoder "$encoder_list" libx265; then
+      printf '  HEVC/libx265: available\n'
+    else
+      printf '  HEVC/libx265: unavailable\n'
+    fi
+    if has_encoder "$encoder_list" libsvtav1; then
+      printf '  AV1/libsvtav1: available\n'
+    else
+      printf '  AV1/libsvtav1: unavailable\n'
+    fi
+  else
+    printf '  ffmpeg:       not found\n'
+    printf '  HEVC/libx265: unavailable\n'
+    printf '  AV1/libsvtav1: unavailable\n'
+  fi
+
+  if command -v ffprobe >/dev/null 2>&1; then
+    ffprobe_line="$(ffprobe -version 2>/dev/null | sed -n '1p')"
+    printf '  ffprobe:      %s (%s)\n' "${ffprobe_line:-available}" "$(command -v ffprobe)"
+  else
+    printf '  ffprobe:      not found\n'
+  fi
+}
+
+require_option_value() {
+  local option="$1"
+  local remaining="$2"
+  local value="${3-}"
+  if [ "$remaining" -lt 2 ]; then
+    die "$option requires a value. See --help for an example."
+  fi
+  case "$value" in
+    --*|-y|-h) die "$option requires a value. See --help for an example." ;;
+  esac
+}
+
+default_output_for() {
+  local input="$1"
+  local dir base
+  dir="$(dirname -- "$input")"
+  base="$(basename -- "${input%.*}")"
+  printf '%s/%s.shrunk.%s\n' "$dir" "$base" "$CONTAINER"
+}
+
+validate_output() {
+  local output="$1"
+  local stream_info
+  [ -s "$output" ] || return 1
+  stream_info="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type \
+    -of csv=p=0 "$output" 2>/dev/null)" || return 1
+  [ "$stream_info" = "video" ] || return 1
+  ffprobe -v error -show_entries format=duration -of default=nw=1 "$output" \
+    >/dev/null 2>&1
+}
+
+run_hevc_encode() {
+  local input="$1"
+  local temp_output="$2"
+  local video_kbps="$3"
+  shift 3
+  local -a mapping_args=("$@")
+
+  say "Encoding with HEVC (pass 1 of 2)..."
+  if ! ffmpeg -y -hide_banner -loglevel warning -stats \
+      -i "$input" -map 0:v:0 \
+      -c:v libx265 -preset "$X265_PRESET" -b:v "${video_kbps}k" \
+      -x265-params "pass=1:stats=${ACTIVE_WORKDIR}/x265_2pass.log:log-level=error" \
+      -an -sn -dn -f null /dev/null; then
+    warn "HEVC pass 1 failed for $(basename -- "$input")."
+    return 1
+  fi
+
+  say "Encoding with HEVC (pass 2 of 2)..."
+  if ! ffmpeg -y -hide_banner -loglevel warning -stats \
+      -i "$input" "${mapping_args[@]}" \
+      -map_metadata 0 -map_chapters 0 \
+      -c:v libx265 -preset "$X265_PRESET" -b:v "${video_kbps}k" \
+      -x265-params "pass=2:stats=${ACTIVE_WORKDIR}/x265_2pass.log:log-level=error" \
+      -c:a aac -b:a "${AUDIO_KBPS}k" \
+      "${SUBTITLE_CODEC_ARGS[@]}" \
+      -f "$OUTPUT_FORMAT" "$temp_output"; then
+    warn "HEVC pass 2 failed for $(basename -- "$input")."
+    return 1
+  fi
+}
+
+run_av1_encode() {
+  local input="$1"
+  local temp_output="$2"
+  local video_kbps="$3"
+  shift 3
+  local -a mapping_args=("$@")
+
+  say "Encoding with AV1... software AV1 encoding can be very slow."
+  ffmpeg -y -hide_banner -loglevel warning -stats \
+    -i "$input" "${mapping_args[@]}" \
+    -map_metadata 0 -map_chapters 0 \
+    -c:v libsvtav1 -preset "$SVT_PRESET" -b:v "${video_kbps}k" \
+    -svtav1-params "rc=1" \
+    -c:a "$AV1_AUDIO_CODEC" -b:a "${AUDIO_KBPS}k" \
+    "${SUBTITLE_CODEC_ARGS[@]}" \
+    -f "$OUTPUT_FORMAT" "$temp_output"
+}
+
+process_file() {
+  local input="$1"
+  local target_mb="$2"
+  local output="$3"
+  local codec="$4"
+  local duration duration_int total_kbit total_kbps video_kbps
+  local audio_map orig_bytes orig_mb target_bytes new_bytes new_mb saved_pct
+  local answer
+  local -a mapping_args
+
+  [ -f "$input" ] || { warn "File not found: $input"; return 1; }
+  [ -d "$(dirname -- "$output")" ] || { warn "Output directory does not exist: $(dirname -- "$output")"; return 1; }
+  [ ! -d "$output" ] || { warn "Output path is a directory: $output"; return 1; }
+
+  if [ "$(canonical_path "$input")" = "$(canonical_path "$output")" ]; then
+    warn "Input and output refer to the same file; refusing to replace the source."
+    return 1
+  fi
+
+  duration="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$input" 2>/dev/null || true)"
+  duration_int="${duration%%.*}"
+  if ! [[ "$duration_int" =~ ^[0-9]+$ ]] || [ "$duration_int" -le 0 ]; then
+    warn "Could not read a valid duration from: $input"
+    return 1
+  fi
+
+  total_kbit=$(( target_mb * 8192 ))
+  total_kbps=$(( total_kbit / duration_int ))
+  video_kbps=$(( total_kbps - AUDIO_KBPS ))
+  if [ "$video_kbps" -lt 64 ]; then
+    warn "$(basename -- "$input"): ${target_mb} MB is too small for its duration; using the minimum video bitrate."
+    video_kbps=64
+  elif [ "$video_kbps" -lt 150 ]; then
+    warn "$(basename -- "$input"): ${target_mb} MB is a very small target for its duration; quality may suffer."
+  fi
+
+  orig_bytes="$(file_size_bytes "$input")"
+  orig_mb="$(human_size_mb "$orig_bytes")"
+  target_bytes=$(( target_mb * 1024 * 1024 ))
+  if [ "$target_bytes" -ge "$orig_bytes" ]; then
+    warn "Requested target (${target_mb} MB) is not smaller than the original (${orig_mb} MB)."
+  fi
+
+  say ""
+  say "File:    $(basename -- "$input")"
+  say "Codec:   $codec"
+  say "Quality: $QUALITY"
+  say "Target:  ${target_mb} MB (currently ${orig_mb} MB)"
+  say "Output:  $output"
+  if [ "$CONTAINER" = "mp4" ]; then
+    say "Note: MP4 output drops subtitles; use MKV to retain them."
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    say "Dry run complete; nothing was encoded."
+    return 0
+  fi
+
+  if [ -e "$output" ] && [ "$FORCE" = false ]; then
+    if ! read -r -p "Output already exists. Replace it? [y/N] " answer; then
+      warn "No response available; skipping $(basename -- "$input")."
+      return 2
+    fi
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) warn "Skipping $(basename -- "$input")."; return 2 ;;
+    esac
+  fi
+
+  cleanup_active
+  ACTIVE_TEMP="${output}.part"
+  ACTIVE_WORKDIR="$(mktemp -d)"
+  rm -f -- "$ACTIVE_TEMP"
+
+  mapping_args=(-map 0:v:0)
+  if [ "$KEEP_ALL_AUDIO" = true ]; then
+    audio_map="0:a?"
+  else
+    audio_map="0:a:0?"
+  fi
+  mapping_args+=(-map "$audio_map")
+  if [ "$CONTAINER" = "mkv" ]; then
+    mapping_args+=(-map "0:s?")
+  fi
+
+  if [ "$codec" = "av1" ]; then
+    if ! run_av1_encode "$input" "$ACTIVE_TEMP" "$video_kbps" "${mapping_args[@]}" || \
+        ! validate_output "$ACTIVE_TEMP"; then
+      rm -f -- "$ACTIVE_TEMP"
+      if [ "$HAS_X265" = true ]; then
+        warn "AV1 encoding or validation failed; retrying with available HEVC/libx265."
+        codec="hevc"
+      else
+        warn "AV1 encoding or validation failed and HEVC/libx265 is not available; no fallback can be used."
+        cleanup_active
+        return 1
+      fi
+    fi
+  fi
+
+  if [ "$codec" = "hevc" ]; then
+    if ! run_hevc_encode "$input" "$ACTIVE_TEMP" "$video_kbps" "${mapping_args[@]}"; then
+      cleanup_active
+      return 1
+    fi
+  fi
+
+  if ! validate_output "$ACTIVE_TEMP"; then
+    warn "ffprobe could not validate the completed encode; the final output was not changed."
+    cleanup_active
+    return 1
+  fi
+
+  if ! mv -f -- "$ACTIVE_TEMP" "$output"; then
+    warn "Could not move the validated encode into place: $output"
+    cleanup_active
+    return 1
+  fi
+  ACTIVE_TEMP=""
+  rm -rf -- "$ACTIVE_WORKDIR"
+  ACTIVE_WORKDIR=""
+
+  new_bytes="$(file_size_bytes "$output")"
+  new_mb="$(human_size_mb "$new_bytes")"
+  if [ "$new_bytes" -lt "$orig_bytes" ]; then
+    saved_pct=$(( 100 - (new_bytes * 100 / orig_bytes) ))
+    say "Done: ${orig_mb} MB -> ${new_mb} MB (${saved_pct}% smaller)"
+  else
+    say "Done: ${orig_mb} MB -> ${new_mb} MB (output is not smaller)"
+  fi
+}
+
+if [ "${1-}" = "doctor" ]; then
+  [ "$#" -eq 1 ] || die "doctor does not accept additional arguments."
+  doctor
+  exit 0
+fi
+
+if [ "$#" -eq 0 ]; then
+  usage
+  exit 1
+fi
+
+declare -a INPUTS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --size)
+      require_option_value "$1" "$#" "${2-}"
+      TARGET_MB="$2"
+      shift 2
+      ;;
+    --quality)
+      require_option_value "$1" "$#" "${2-}"
+      QUALITY="$2"
+      shift 2
+      ;;
+    --codec)
+      require_option_value "$1" "$#" "${2-}"
+      CODEC="$2"
+      shift 2
+      ;;
+    --container)
+      require_option_value "$1" "$#" "${2-}"
+      CONTAINER="$2"
+      shift 2
+      ;;
+    --output)
+      require_option_value "$1" "$#" "${2-}"
+      OUTPUT="$2"
+      shift 2
+      ;;
+    --batch)
+      require_option_value "$1" "$#" "${2-}"
+      BATCH_DIR="$2"
+      shift 2
+      ;;
+    --keep-all-audio) KEEP_ALL_AUDIO=true; shift ;;
+    --recursive) RECURSIVE=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -y) FORCE=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --version) printf 'shrinkray v%s\n' "$VERSION"; exit 0 ;;
+    -*) die "Unknown option: $1 (see --help)" ;;
+    *) INPUTS+=("$1"); shift ;;
+  esac
+done
+
+[[ "$TARGET_MB" =~ ^[1-9][0-9]*$ ]] || die "--size must be a positive whole number of megabytes."
+case "$QUALITY" in fast|good|best) ;; *) die "--quality must be fast, good, or best." ;; esac
+case "$CODEC" in auto|hevc|av1) ;; *) die "--codec must be auto, hevc, or av1." ;; esac
+case "$CONTAINER" in mkv|mp4) ;; *) die "--container must be mkv or mp4." ;; esac
+
+if [ -n "$BATCH_DIR" ]; then
+  [ "${#INPUTS[@]}" -eq 0 ] || die "Do not provide input files with --batch."
+  [ -z "$OUTPUT" ] || die "--output cannot be used with --batch."
+else
+  [ "${#INPUTS[@]}" -gt 0 ] || die "No input file provided. See --help."
+  [ "${#INPUTS[@]}" -eq 1 ] || die "Multiple input files require --batch."
+  [ "$RECURSIVE" = false ] || die "--recursive can only be used with --batch."
+fi
+
+need_bin ffmpeg
+need_bin ffprobe
+
+ENCODER_LIST="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+HAS_X265=false
+HAS_SVTAV1=false
+has_encoder "$ENCODER_LIST" libx265 && HAS_X265=true
+has_encoder "$ENCODER_LIST" libsvtav1 && HAS_SVTAV1=true
+
+case "$CODEC" in
+  auto)
+    [ "$HAS_X265" = true ] || die "Auto mode requires HEVC/libx265. Use --codec av1 explicitly if AV1 is available."
+    CODEC="hevc"
+    ;;
+  hevc)
+    [ "$HAS_X265" = true ] || die "HEVC/libx265 is not available in this ffmpeg build."
+    ;;
+  av1)
+    [ "$HAS_SVTAV1" = true ] || die "AV1/libsvtav1 is not available in this ffmpeg build."
+    ;;
+esac
+
+case "$QUALITY" in
+  fast) X265_PRESET="fast"; SVT_PRESET=8 ;;
+  good) X265_PRESET="slow"; SVT_PRESET=6 ;;
+  best) X265_PRESET="veryslow"; SVT_PRESET=4 ;;
+esac
+
+if [ "$CONTAINER" = "mp4" ]; then
+  OUTPUT_FORMAT="mp4"
+  AV1_AUDIO_CODEC="aac"
+  SUBTITLE_CODEC_ARGS=()
+else
+  OUTPUT_FORMAT="matroska"
+  AV1_AUDIO_CODEC="libopus"
+  SUBTITLE_CODEC_ARGS=(-c:s copy)
+fi
+
+if [ -n "$BATCH_DIR" ]; then
+  [ -d "$BATCH_DIR" ] || die "Not a directory: $BATCH_DIR"
+
+  say "Scanning $BATCH_DIR for video files..."
+  declare -a FIND_ARGS=("$BATCH_DIR")
+  if [ "$RECURSIVE" = false ]; then
+    FIND_ARGS+=(-maxdepth 1)
+  fi
+  FIND_ARGS+=(-type f -print0)
+
+  declare -a FOUND_FILES=()
+  mapfile -d '' -t FOUND_FILES < <(find "${FIND_ARGS[@]}" | sort -z)
+  declare -a FILES=()
+  SUCCESSFUL=0
+  FAILED=0
+  SKIPPED=0
+  TOTAL_ORIG=0
+  TOTAL_NEW=0
+
+  for file in "${FOUND_FILES[@]}"; do
+    is_video_file "$file" || continue
+    if [[ "$file" == *".shrunk."* ]]; then
+      SKIPPED=$((SKIPPED + 1))
+    else
+      FILES+=("$file")
+    fi
+  done
+
+  say "Found ${#FILES[@]} source video file(s)."
+  for file in "${FILES[@]}"; do
+    output_path="$(default_output_for "$file")"
+    before_bytes="$(file_size_bytes "$file")"
+    if process_file "$file" "$TARGET_MB" "$output_path" "$CODEC"; then
+      SUCCESSFUL=$((SUCCESSFUL + 1))
+      if [ "$DRY_RUN" = false ]; then
+        TOTAL_ORIG=$((TOTAL_ORIG + before_bytes))
+        TOTAL_NEW=$((TOTAL_NEW + $(file_size_bytes "$output_path")))
+      fi
+    else
+      result=$?
+      if [ "$result" -eq 2 ]; then
+        SKIPPED=$((SKIPPED + 1))
+      else
+        FAILED=$((FAILED + 1))
+      fi
+    fi
+  done
+
+  say ""
+  say "Batch summary: ${SUCCESSFUL} successful, ${FAILED} failed, ${SKIPPED} skipped."
+  if [ "$DRY_RUN" = false ] && [ "$SUCCESSFUL" -gt 0 ]; then
+    say "Total size: $(human_size_mb "$TOTAL_ORIG") MB -> $(human_size_mb "$TOTAL_NEW") MB"
+  fi
+  [ "$FAILED" -eq 0 ] || exit 1
+else
+  INPUT="${INPUTS[0]}"
+  [ -f "$INPUT" ] || die "File not found: $INPUT"
+  OUTPUT="${OUTPUT:-$(default_output_for "$INPUT")}"
+  if process_file "$INPUT" "$TARGET_MB" "$OUTPUT" "$CODEC"; then
+    exit 0
+  else
+    result=$?
+    [ "$result" -eq 2 ] && exit 0
+    exit 1
+  fi
+fi
