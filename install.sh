@@ -3,13 +3,13 @@
 # shrinkray installer for Ubuntu and Linux Mint
 #
 # Local install (default):
-#   curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install.sh | bash
 # System install:
-#   curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash -s -- --system
+#   curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install.sh | bash -s -- --system
 #
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/AmirIqbal1/shinkray/main"
+REPO_RAW="https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main"
 SYSTEM_MODE=false
 TEMP_DIR=""
 
@@ -23,7 +23,7 @@ Install shrinkray on Ubuntu or Linux Mint.
 
 USAGE:
   ./install.sh [--system]
-  curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install.sh | bash
 
 OPTIONS:
   --system    Install to /usr/local/bin using sudo
@@ -166,7 +166,7 @@ if LOCAL_SOURCE="$(find_local_source)"; then
   cp -- "$LOCAL_SOURCE" "$SOURCE_FILE"
 else
   command -v curl >/dev/null 2>&1 || die "curl is required to download shrinkray. Install it with: sudo apt-get install curl"
-  say "Downloading shrinkray from AmirIqbal1/shinkray."
+  say "Downloading shrinkray from AmirIqbal1/shrinkray."
   curl -fsSL "${REPO_RAW}/shrinkray" -o "$SOURCE_FILE" || die "Download failed. Check your network connection and try again."
 fi
 

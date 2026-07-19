@@ -67,7 +67,61 @@ Separate roots are safer than `--root /media`: Shrinkray can browse only the
 configured Movies and TV libraries, not unrelated folders that happen to live
 under `/media`. Configured roots must not overlap.
 
-For safe access to a remote server, keep that default and open an SSH tunnel:
+### Systemd server installation
+
+On Ubuntu Server, Ubuntu Desktop, or Linux Mint, install the CLI, dashboard,
+managed configuration, and systemd service with:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install-server.sh \
+  | sudo bash -s -- \
+      --user amir \
+      --root "Movies=/media/movies" \
+      --root "TV Shows=/media/tv"
+```
+
+The managed service always listens on `127.0.0.1:8787` by default. Existing
+Tailscale access uses a separate HTTPS listener on port `8443`; Shrinkray never
+automatically claims HTTPS port `443`. Re-running the installer updates the
+binaries while preserving the configured user, backend port, Tailscale HTTPS
+port, and roots unless replacements are provided explicitly. Use
+`--tailscale-https-port <port>` to select another unused non-443 private port,
+`--source-dir /path/to/shrinkray` to build from a local checkout, or `--dry-run`
+to validate without installing system files.
+
+The safe layout on a server that already runs Coolify or another public reverse
+proxy is:
+
+```text
+Coolify / public reverse proxy:
+https://panel.example.com
+host port 443
+
+Shrinkray local backend:
+http://127.0.0.1:8787
+
+Shrinkray private browser URL:
+https://hostname.tailnet.ts.net:8443/
+```
+
+For Amir's current server, the private dashboard URL is:
+
+```text
+https://home-server.tailb4ae63.ts.net:8443/
+```
+
+Port `443` remains reserved for Coolify, Traefik, Caddy, Nginx, Apache, or
+another host reverse proxy. Port `8443` is the private Tailscale HTTPS listener,
+and port `8787` remains bound to localhost only. Do not use Tailscale Funnel,
+do not run `tailscale serve reset`, and do not expose port `8787` through a
+router. During an upgrade, the installer can migrate a clearly owned old
+Shrinkray listener from Tailscale HTTPS port 443: it configures and verifies
+8443 first, then removes only the old 443 listener. Ambiguous or unrelated
+routes are never removed.
+
+For access without Tailscale Serve, keep the loopback default and open an SSH
+tunnel:
 
 ```bash
 ssh -L 8787:127.0.0.1:8787 user@server
@@ -75,14 +129,22 @@ ssh -L 8787:127.0.0.1:8787 user@server
 
 Then open <http://127.0.0.1:8787> on the local device.
 
-On a trusted LAN or Tailscale network, listen on all interfaces explicitly:
+The managed installer does not offer a public bind mode. For diagnostics, run:
 
-```bash
-go run ./cmd/shrinkray-server \
-  --root /media/movies \
-  --listen 0.0.0.0:8787 \
-  --shrinkray-bin ./shrinkray
+```text
+shrinkray-server-doctor
+shrinkray-server-doctor --repair
+systemctl status shrinkray
+journalctl -u shrinkray -f
+tailscale serve status
+ss -ltnp | grep -E ':(443|8443|8787)\b'
 ```
+
+Normal doctor mode is read-only. Repair mode can restart only the Shrinkray
+service, configure its non-443 Tailscale listener, and remove an old 443
+listener only when that listener clearly proxies solely to Shrinkray. It never
+restarts Docker or Coolify, changes media permissions, resets Serve, or uses
+Funnel.
 
 **The dashboard has no authentication. Do not expose it directly to the public
 internet. Use localhost, SSH tunnelling, a trusted LAN, Tailscale, or a
@@ -103,7 +165,7 @@ with `apt-get` when it is missing, then installs the `shrinkray` command for
 your user.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install.sh | bash
 ```
 
 Open a new terminal after installation, then check that everything is ready:
@@ -115,15 +177,15 @@ shrinkray doctor
 To install from a clone instead:
 
 ```bash
-git clone https://github.com/AmirIqbal1/shinkray.git
-cd shinkray
+git clone https://github.com/AmirIqbal1/shrinkray.git
+cd shrinkray
 ./install.sh
 ```
 
 For a system-wide installation in `/usr/local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash -s -- --system
+curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install.sh | bash -s -- --system
 ```
 
 The default user installation goes to `~/.local/bin` and does not need `sudo`

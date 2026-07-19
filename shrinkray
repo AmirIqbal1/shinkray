@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # shrinkray - point it at a video, get a much smaller one back.
-# https://github.com/AmirIqbal1/shinkray
+# https://github.com/AmirIqbal1/shrinkray
 #
 set -euo pipefail
 
