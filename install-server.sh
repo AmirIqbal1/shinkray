@@ -2,25 +2,53 @@
 #
 # Install and manage the Shrinkray dashboard as a systemd service.
 #
-set -euo pipefail
+set -Eeuo pipefail
 
 REPOSITORY_ARCHIVE="https://github.com/AmirIqbal1/shrinkray/archive/refs/heads/main.tar.gz"
-CONFIG_DIR="/etc/shrinkray"
+TEST_MODE=false
+INSTALL_ROOT=""
+TEST_LOG=""
+if [ "${SHRINKRAY_INSTALL_TEST_MODE:-0}" = 1 ]; then
+  TEST_MODE=true
+  INSTALL_ROOT="${SHRINKRAY_INSTALL_ROOT:-}"
+  [ -n "$INSTALL_ROOT" ] || {
+    printf 'xx  SHRINKRAY_INSTALL_ROOT is required in installer test mode.\n' >&2
+    exit 1
+  }
+  [[ "$INSTALL_ROOT" == /* ]] || {
+    printf 'xx  SHRINKRAY_INSTALL_ROOT must be an absolute path.\n' >&2
+    exit 1
+  }
+  mkdir -p -- "$INSTALL_ROOT"
+  INSTALL_ROOT="$(realpath -e -- "$INSTALL_ROOT")"
+  [ "$INSTALL_ROOT" != / ] || {
+    printf 'xx  Installer test mode refuses to use / as SHRINKRAY_INSTALL_ROOT.\n' >&2
+    exit 1
+  }
+  TEST_LOG="${INSTALL_ROOT}/shrinkray-install-test.log"
+  : > "$TEST_LOG"
+  chmod 0600 "$TEST_LOG"
+fi
+
+CONFIG_DIR="${INSTALL_ROOT}/etc/shrinkray"
 CONFIG_FILE="${CONFIG_DIR}/server.conf"
-STATE_DIR_DEFAULT="/var/lib/shrinkray"
-LAUNCHER_FILE="/usr/local/libexec/shrinkray-server-launcher"
-SERVICE_FILE="/etc/systemd/system/shrinkray.service"
-SHRINKRAY_BIN="/usr/local/bin/shrinkray"
-SERVER_BIN="/usr/local/bin/shrinkray-server"
+STATE_DIR_DEFAULT="${INSTALL_ROOT}/var/lib/shrinkray"
+LAUNCHER_FILE="${INSTALL_ROOT}/usr/local/libexec/shrinkray-server-launcher"
+SERVICE_FILE="${INSTALL_ROOT}/etc/systemd/system/shrinkray.service"
+SHRINKRAY_BIN="${INSTALL_ROOT}/usr/local/bin/shrinkray"
+SERVER_BIN="${INSTALL_ROOT}/usr/local/bin/shrinkray-server"
+DOCTOR_BIN="${INSTALL_ROOT}/usr/local/bin/shrinkray-server-doctor"
 
 SERVICE_USER=""
 SERVICE_GROUP=""
 PORT="8787"
+TAILSCALE_HTTPS_PORT="8443"
 STATE_DIR="$STATE_DIR_DEFAULT"
 SOURCE_DIR_ARG=""
 TAILSCALE_URL=""
 USER_EXPLICIT=false
 PORT_EXPLICIT=false
+TAILSCALE_HTTPS_PORT_EXPLICIT=false
 ROOTS_SUPPLIED=false
 SKIP_TAILSCALE=false
 FORCE_TAILSCALE=false
@@ -35,6 +63,14 @@ GO_LINK_TMP=""
 GO_INSTALL_IN_PROGRESS=false
 MANAGED_CONFIG_FOUND=false
 MANUAL_SERVICE_FOUND=false
+FILES_REPLACED=false
+INSTALL_SUCCEEDED=false
+ROLLBACK_IN_PROGRESS=false
+PREVIOUS_SERVICE_ACTIVE=false
+PREVIOUS_PORT=""
+BACKUP_DIR=""
+DETECTED_TAILSCALE_URL=""
+TEST_SERVE_STATUS="${SHRINKRAY_INSTALL_TEST_TAILSCALE_SERVE_STATUS:-No serve config}"
 
 declare -a REQUESTED_ROOTS=()
 declare -a EXISTING_ROOTS=()
@@ -45,9 +81,33 @@ declare -a ROOT_IDS=()
 declare -a ROOT_PATHS=()
 declare -a PARSED_WORDS=()
 
-say() { printf '==> %s\n' "$*"; }
+say() {
+  if [ "$DRY_RUN" = true ]; then
+    printf 'DRY-RUN: %s\n' "$*"
+  else
+    printf '==> %s\n' "$*"
+  fi
+}
 warn() { printf '!!  %s\n' "$*" >&2; }
-die() { printf 'xx  %s\n' "$*" >&2; exit 1; }
+die() {
+  printf 'xx  %s\n' "$*" >&2
+  if [ "$FILES_REPLACED" = true ] && [ "$ROLLBACK_IN_PROGRESS" = false ]; then
+    rollback_installation || true
+  fi
+  exit 1
+}
+
+record_command() {
+  local argument
+  [ "$TEST_MODE" = true ] || return 0
+  {
+    printf 'COMMAND:'
+    for argument in "$@"; do
+      printf ' %q' "$argument"
+    done
+    printf '\n'
+  } >> "$TEST_LOG"
+}
 
 usage() {
   cat <<'EOF'
@@ -63,21 +123,27 @@ OPTIONS:
   --root <path>              Media root (repeatable)
   --root "Name=/path"        Named media root (repeatable)
   --port <port>              Loopback HTTP port (default: 8787)
+  --tailscale-https-port <port>
+                             Private Tailscale HTTPS port (default: 8443)
   --skip-tailscale           Do not inspect or change Tailscale Serve
-  --force-tailscale          Reserved for explicit Tailscale reconfiguration
-  --tailscale-url <url>      Expected private HTTPS URL
+  --force-tailscale          Legacy acknowledgement; never bypasses port safety
+  --tailscale-url <url>      Override the displayed/checked private HTTPS URL
   --source-dir <checkout>    Build from a local Shrinkray checkout
   --non-interactive          Never prompt for missing information
   --dry-run                  Validate and show changes without installing
   -h, --help                 Show this help
 
-On updates, omitted roots, user, and port are preserved from the managed
-configuration or migrated service where available. Supplying --root replaces
-the configured root list.
+On updates, omitted roots, user, backend port, and Tailscale HTTPS port are
+preserved from the managed configuration where available. Supplying --root
+replaces the configured root list. Port 443 is never accepted for Shrinkray's
+automatic Tailscale Serve configuration.
 EOF
 }
 
 cleanup() {
+	if [ "$FILES_REPLACED" = true ] && [ "$INSTALL_SUCCEEDED" = false ] && [ "$ROLLBACK_IN_PROGRESS" = false ]; then
+		rollback_installation || true
+	fi
 	if [ "$GO_INSTALL_IN_PROGRESS" = true ]; then
 		if { [ -z "$GO_NEW_DIR" ] || [ ! -e "$GO_NEW_DIR" ]; } && [ -e /usr/local/go ]; then
 			rm -rf -- /usr/local/go
@@ -98,6 +164,15 @@ cleanup() {
     rm -rf -- "$TEMP_DIR"
   fi
 }
+installer_error() {
+  local status="$1"
+  trap - ERR
+  if [ "$FILES_REPLACED" = true ] && [ "$ROLLBACK_IN_PROGRESS" = false ]; then
+    rollback_installation || true
+  fi
+  exit "$status"
+}
+trap 'installer_error $?' ERR
 trap cleanup EXIT HUP INT TERM
 
 require_value() {
@@ -142,6 +217,13 @@ while [ "$#" -gt 0 ]; do
       validate_text_argument "$1" "$2"
       PORT="$2"
       PORT_EXPLICIT=true
+      shift 2
+      ;;
+    --tailscale-https-port)
+      require_value "$1" "$#" "${2-}"
+      validate_text_argument "$1" "$2"
+      TAILSCALE_HTTPS_PORT="$2"
+      TAILSCALE_HTTPS_PORT_EXPLICIT=true
       shift 2
       ;;
     --skip-tailscale)
@@ -191,17 +273,28 @@ validate_port() {
 }
 
 validate_port "$PORT"
+validate_port "$TAILSCALE_HTTPS_PORT"
+if [ "$TAILSCALE_HTTPS_PORT" = 443 ]; then
+  die "Refusing Tailscale HTTPS port 443; it must remain available for the host reverse proxy. Choose --tailscale-https-port 8443 or another unused non-443 port."
+fi
 if [ "$SKIP_TAILSCALE" = true ] && [ "$FORCE_TAILSCALE" = true ]; then
   die "--skip-tailscale and --force-tailscale cannot be used together."
 fi
 if [ -n "$TAILSCALE_URL" ] && [[ "$TAILSCALE_URL" != https://* ]]; then
   die "--tailscale-url must be an https:// URL."
 fi
-if [ "$DRY_RUN" = false ] && [ "$(id -u)" -ne 0 ]; then
+if [ "$DRY_RUN" = false ] && [ "$TEST_MODE" = false ] && [ "$(id -u)" -ne 0 ]; then
   die "Production installation must run as root. Re-run with sudo, or use --dry-run."
+fi
+if [ "$TEST_MODE" = true ] && [ -z "$SOURCE_DIR_ARG" ]; then
+  die "Installer test mode requires --source-dir; downloads are disabled."
 fi
 
 detect_platform() {
+  if [ "$TEST_MODE" = true ]; then
+    say "Installer test mode is active under $INSTALL_ROOT."
+    return
+  fi
   [ -r /etc/os-release ] || die "Cannot identify this Linux distribution (/etc/os-release is missing)."
   # shellcheck disable=SC1091
   . /etc/os-release
@@ -223,8 +316,14 @@ package_installed() {
 
 install_dependencies() {
   local package
-  local -a packages=(ca-certificates curl tar gzip ffmpeg coreutils systemd util-linux)
+  local -a packages=(ca-certificates curl tar gzip ffmpeg coreutils iproute2 systemd util-linux)
   local -a missing=()
+  if [ "$TEST_MODE" = true ]; then
+    say "Test mode: package installation is disabled."
+    record_command apt-get update
+    record_command apt-get install -y "${packages[@]}"
+    return
+  fi
   command -v dpkg-query >/dev/null 2>&1 || die "dpkg-query is required on supported systems."
   for package in "${packages[@]}"; do
     package_installed "$package" || missing+=("$package")
@@ -232,7 +331,7 @@ install_dependencies() {
   if [ "${#missing[@]}" -eq 0 ]; then
     say "Required system packages are already installed."
   elif [ "$DRY_RUN" = true ]; then
-    say "Dry run: would install packages: ${missing[*]}"
+    say "Would install packages: ${missing[*]}"
   else
     say "Installing required packages: ${missing[*]}"
     apt-get update
@@ -240,14 +339,14 @@ install_dependencies() {
   fi
   if [ "$DRY_RUN" = false ]; then
     local command_name
-    for command_name in curl tar gzip ffmpeg ffprobe realpath systemctl runuser stat sha256sum; do
+    for command_name in curl tar gzip ffmpeg ffprobe realpath ss systemctl runuser stat sha256sum; do
       command -v "$command_name" >/dev/null 2>&1 || die "Required command is unavailable after package installation: $command_name"
     done
   fi
 }
 
 validate_managed_config_file() {
-	if [ -L "$CONFIG_DIR" ] || [ "$(stat -c '%u' "$CONFIG_DIR")" -ne 0 ]; then
+	if [ -L "$CONFIG_DIR" ] || { [ "$TEST_MODE" = false ] && [ "$(stat -c '%u' "$CONFIG_DIR")" -ne 0 ]; }; then
 		die "$CONFIG_DIR must be a root-owned, non-symlink directory."
 	fi
 	local directory_mode directory_mode_value
@@ -257,7 +356,9 @@ validate_managed_config_file() {
   if [ ! -f "$CONFIG_FILE" ] || [ -L "$CONFIG_FILE" ]; then
 		die "$CONFIG_FILE must be a regular, non-symlink file."
 	fi
-  [ "$(stat -c '%u' "$CONFIG_FILE")" -eq 0 ] || die "$CONFIG_FILE must be owned by root."
+  if [ "$TEST_MODE" = false ]; then
+    [ "$(stat -c '%u' "$CONFIG_FILE")" -eq 0 ] || die "$CONFIG_FILE must be owned by root."
+  fi
   local mode mode_value
   mode="$(stat -c '%a' "$CONFIG_FILE")"
   mode_value=$((8#$mode))
@@ -271,7 +372,9 @@ load_managed_config() {
 		die "$CONFIG_DIR must be a real directory, not a symlink or other file type."
 	fi
 	if [ -d "$CONFIG_DIR" ]; then
-		[ "$(stat -c '%u' "$CONFIG_DIR")" -eq 0 ] || die "$CONFIG_DIR must be owned by root."
+		if [ "$TEST_MODE" = false ]; then
+			[ "$(stat -c '%u' "$CONFIG_DIR")" -eq 0 ] || die "$CONFIG_DIR must be owned by root."
+		fi
 		config_directory_mode="$(stat -c '%a' "$CONFIG_DIR")"
 		config_directory_mode_value=$((8#$config_directory_mode))
 		(( (config_directory_mode_value & 8#022) == 0 )) || die "$CONFIG_DIR must not be writable by group or others."
@@ -281,6 +384,7 @@ load_managed_config() {
   local SHRINKRAY_USER=""
   local SHRINKRAY_GROUP=""
   local SHRINKRAY_PORT=""
+  local SHRINKRAY_TAILSCALE_HTTPS_PORT="8443"
   local SHRINKRAY_STATE_DIR=""
   local -a SHRINKRAY_ROOTS=()
   # This file is accepted only after root ownership, mode, and syntax checks.
@@ -292,11 +396,13 @@ load_managed_config() {
 	validate_text_argument "configured group" "$SHRINKRAY_GROUP"
 	validate_text_argument "configured state directory" "$SHRINKRAY_STATE_DIR"
   validate_port "$SHRINKRAY_PORT"
+  validate_port "$SHRINKRAY_TAILSCALE_HTTPS_PORT"
   [[ "$SHRINKRAY_STATE_DIR" == /* ]] || die "$CONFIG_FILE has an invalid SHRINKRAY_STATE_DIR."
   [ "${#SHRINKRAY_ROOTS[@]}" -gt 0 ] || die "$CONFIG_FILE does not contain media roots."
   EXISTING_USER="$SHRINKRAY_USER"
   EXISTING_GROUP="$SHRINKRAY_GROUP"
   EXISTING_PORT="$SHRINKRAY_PORT"
+  EXISTING_TAILSCALE_HTTPS_PORT="$SHRINKRAY_TAILSCALE_HTTPS_PORT"
   EXISTING_STATE_DIR="$SHRINKRAY_STATE_DIR"
   EXISTING_ROOTS=("${SHRINKRAY_ROOTS[@]}")
   MANAGED_CONFIG_FOUND=true
@@ -382,7 +488,9 @@ split_systemd_words() {
 migrate_manual_service() {
   [ "$MANAGED_CONFIG_FOUND" = false ] || return 0
   [ -f "$SERVICE_FILE" ] && [ ! -L "$SERVICE_FILE" ] || return 0
-	[ "$(stat -c '%u' "$SERVICE_FILE")" -eq 0 ] || die "$SERVICE_FILE must be owned by root before it can be migrated."
+	if [ "$TEST_MODE" = false ]; then
+		[ "$(stat -c '%u' "$SERVICE_FILE")" -eq 0 ] || die "$SERVICE_FILE must be owned by root before it can be migrated."
+	fi
   grep -Fq 'shrinkray-server' "$SERVICE_FILE" || return 0
   local manual_user manual_group exec_start working_directory
   local index token value listen
@@ -446,6 +554,10 @@ valid_account_name() {
 account_exists_non_root() {
   local account="$1" uid
   valid_account_name "$account" || return 1
+  if [ "$TEST_MODE" = true ]; then
+    [ "$account" != root ]
+    return
+  fi
   uid="$(id -u "$account" 2>/dev/null)" || return 1
   [ "$uid" -ne 0 ]
 }
@@ -469,10 +581,16 @@ select_service_user() {
   fi
   account_exists_non_root "$SERVICE_USER" || die "Service user does not exist or is root: $SERVICE_USER"
   if [ -z "$SERVICE_GROUP" ] || [ "$USER_EXPLICIT" = true ]; then
-    SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
+    if [ "$TEST_MODE" = true ]; then
+      SERVICE_GROUP="$SERVICE_USER"
+    else
+      SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
+    fi
   fi
   valid_account_name "$SERVICE_GROUP" || die "Invalid service group: $SERVICE_GROUP"
-  getent group "$SERVICE_GROUP" >/dev/null 2>&1 || die "Service group does not exist: $SERVICE_GROUP"
+  if [ "$TEST_MODE" = false ]; then
+    getent group "$SERVICE_GROUP" >/dev/null 2>&1 || die "Service group does not exist: $SERVICE_GROUP"
+  fi
 }
 
 select_preserved_settings() {
@@ -484,10 +602,24 @@ select_preserved_settings() {
     fi
   fi
   validate_port "$PORT"
+  if [ "$TAILSCALE_HTTPS_PORT_EXPLICIT" = false ] && [ "$MANAGED_CONFIG_FOUND" = true ]; then
+    if [ "$EXISTING_TAILSCALE_HTTPS_PORT" = 443 ]; then
+      TAILSCALE_HTTPS_PORT=8443
+      warn "Migrating legacy configured Tailscale HTTPS port 443 to the safe default 8443."
+    else
+      TAILSCALE_HTTPS_PORT="$EXISTING_TAILSCALE_HTTPS_PORT"
+    fi
+  fi
+  validate_port "$TAILSCALE_HTTPS_PORT"
+  [ "$TAILSCALE_HTTPS_PORT" != 443 ] || die "Refusing Tailscale HTTPS port 443; choose --tailscale-https-port 8443 or another unused non-443 port."
+  [ "$TAILSCALE_HTTPS_PORT" != "$PORT" ] || die "The backend port and Tailscale HTTPS port must be different."
   if [ "$MANAGED_CONFIG_FOUND" = true ]; then
     STATE_DIR="$EXISTING_STATE_DIR"
   elif [ "$MANUAL_SERVICE_FOUND" = true ] && [ -n "$MANUAL_STATE_DIR" ]; then
     STATE_DIR="$MANUAL_STATE_DIR"
+  fi
+  if [ "$TEST_MODE" = true ] && [[ "$STATE_DIR" == /var/lib || "$STATE_DIR" == /var/lib/* ]]; then
+    STATE_DIR="${INSTALL_ROOT}${STATE_DIR}"
   fi
   if [[ "$STATE_DIR" != /* ]] || [ "$STATE_DIR" = / ]; then
 		die "Invalid state directory: $STATE_DIR"
@@ -546,11 +678,19 @@ permission_failure() {
   local root="$1"
   warn "Service user '$SERVICE_USER' cannot safely use media root: $root"
   warn "Path details: owner=$(stat -c '%U' "$root") group=$(stat -c '%G' "$root") mode=$(stat -c '%A (%a)' "$root")"
-  warn "Service user memberships: $(id "$SERVICE_USER")"
+  if [ "$TEST_MODE" = true ]; then
+    warn "Service user memberships: test user/group ${SERVICE_USER}:${SERVICE_GROUP}"
+  else
+    warn "Service user memberships: $(id "$SERVICE_USER")"
+  fi
   warn "No ownership, mode, or ACL changes were made to the media directory."
 }
 
 as_service_user() {
+	if [ "$TEST_MODE" = true ]; then
+		"$@"
+		return
+	fi
 	if [ "$(id -u)" -eq 0 ]; then
 		runuser -u "$SERVICE_USER" -- "$@"
 	elif [ "$(id -un)" = "$SERVICE_USER" ]; then
@@ -568,6 +708,10 @@ verify_root_permissions() {
     permission_failure "$root"
     return 1
   fi
+	if [ "$DRY_RUN" = true ]; then
+		say "Would verify create/remove access in media root: $root"
+		return 0
+	fi
 	if ! test_file="$(as_service_user mktemp "${root}/.shrinkray-install-test.XXXXXX")"; then
     permission_failure "$root"
     return 1
@@ -632,6 +776,7 @@ validate_source_tree() {
   [ -f "$source/go.mod" ] || die "Source tree is missing go.mod: $source"
   [ -f "$source/shrinkray" ] || die "Source tree is missing shrinkray: $source"
   [ -d "$source/cmd/shrinkray-server" ] || die "Source tree is missing cmd/shrinkray-server: $source"
+  [ -f "$source/scripts/shrinkray-server-doctor.sh" ] || die "Source tree is missing scripts/shrinkray-server-doctor.sh: $source"
 }
 
 prepare_source() {
@@ -644,7 +789,7 @@ prepare_source() {
     return
   fi
   if [ "$DRY_RUN" = true ]; then
-    say "Dry run: would download $REPOSITORY_ARCHIVE"
+    say "Would download $REPOSITORY_ARCHIVE"
     SOURCE_DIR=""
     return
   fi
@@ -725,8 +870,10 @@ ensure_go() {
   fi
 	if [[ "$installed" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] && version_at_least "$installed" "$required"; then
     say "Using Go $installed from $GO_BIN (go.mod requires $required)."
+  elif [ "$TEST_MODE" = true ]; then
+    die "Installer test mode requires an already installed Go toolchain at least as new as $required."
   elif [ "$DRY_RUN" = true ]; then
-    say "Dry run: would install the latest stable official Go (go.mod requires $required)."
+    say "Would install the latest stable official Go (go.mod requires $required)."
     GO_BIN=""
   else
     install_official_go
@@ -738,11 +885,11 @@ ensure_go() {
 
 build_and_validate() {
   [ -n "$SOURCE_DIR" ] || {
-    say "Dry run: source download and build skipped."
+    say "Source download and build skipped in dry-run mode."
     return
   }
   [ -n "$GO_BIN" ] || {
-    say "Dry run: build skipped because a sufficient Go toolchain is not installed."
+    say "Build skipped because a sufficient Go toolchain is not installed."
     return
   }
   local build_dir server_version
@@ -757,7 +904,9 @@ build_and_validate() {
 	server_version="$("${build_dir}/shrinkray-server" --version)"
   [[ "$server_version" == shrinkray-server\ v* ]] || die "Built server failed its version check."
   bash -n "$SOURCE_DIR/shrinkray"
+  bash -n "$SOURCE_DIR/scripts/shrinkray-server-doctor.sh"
   install -m 0755 "$SOURCE_DIR/shrinkray" "${build_dir}/shrinkray"
+  install -m 0755 "$SOURCE_DIR/scripts/shrinkray-server-doctor.sh" "${build_dir}/shrinkray-server-doctor"
   say "Validated $server_version and the Bash CLI."
 }
 
@@ -773,6 +922,7 @@ write_config_candidate() {
     printf 'SHRINKRAY_USER=%s\n' "$(shell_quote "$SERVICE_USER")"
     printf 'SHRINKRAY_GROUP=%s\n' "$(shell_quote "$SERVICE_GROUP")"
     printf 'SHRINKRAY_PORT=%s\n' "$(shell_quote "$PORT")"
+    printf 'SHRINKRAY_TAILSCALE_HTTPS_PORT=%s\n' "$(shell_quote "$TAILSCALE_HTTPS_PORT")"
     printf 'SHRINKRAY_STATE_DIR=%s\n' "$(shell_quote "$STATE_DIR")"
     printf 'SHRINKRAY_ROOTS=(\n'
     for ((index = 0; index < ${#ROOT_PATHS[@]}; index++)); do
@@ -786,28 +936,28 @@ write_config_candidate() {
 
 write_launcher_candidate() {
   local target="$1"
-  cat > "$target" <<'EOF'
+  cat > "$target" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly config_file=/etc/shrinkray/server.conf
-[ -r "$config_file" ] || {
-  printf 'shrinkray-server-launcher: missing configuration: %s\n' "$config_file" >&2
+readonly config_file=$(shell_quote "$CONFIG_FILE")
+[ -r "\$config_file" ] || {
+  printf 'shrinkray-server-launcher: missing configuration: %s\n' "\$config_file" >&2
   exit 1
 }
 # shellcheck source=/etc/shrinkray/server.conf
-. "$config_file"
+. "\$config_file"
 
 args=(
-  --listen "127.0.0.1:${SHRINKRAY_PORT}"
-  --shrinkray-bin /usr/local/bin/shrinkray
-  --state-dir "${SHRINKRAY_STATE_DIR}"
+  --listen "127.0.0.1:\${SHRINKRAY_PORT}"
+  --shrinkray-bin $(shell_quote "$SHRINKRAY_BIN")
+  --state-dir "\${SHRINKRAY_STATE_DIR}"
 )
-for root in "${SHRINKRAY_ROOTS[@]}"; do
-  args+=(--root "$root")
+for root in "\${SHRINKRAY_ROOTS[@]}"; do
+  args+=(--root "\$root")
 done
 
-exec /usr/local/bin/shrinkray-server "${args[@]}"
+exec $(shell_quote "$SERVER_BIN") "\${args[@]}"
 EOF
   chmod 0755 "$target"
   bash -n "$target" || die "Generated launcher failed Bash syntax validation."
@@ -834,7 +984,7 @@ Wants=network-online.target
 Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
-ExecStart=/usr/local/libexec/shrinkray-server-launcher
+ExecStart=$(systemd_quote "$LAUNCHER_FILE")
 WorkingDirectory=$(systemd_quote "$STATE_DIR")
 Restart=on-failure
 RestartSec=5
@@ -864,10 +1014,136 @@ EOF
   chmod 0644 "$target"
 }
 
+run_systemctl() {
+  record_command systemctl "$@"
+  if [ "$TEST_MODE" = true ]; then
+    case "${1-}" in
+      is-active)
+        [ "${SHRINKRAY_INSTALL_TEST_SERVICE_ACTIVE:-0}" = 1 ] || [ "${TEST_SERVICE_ACTIVE:-false}" = true ]
+        ;;
+      enable|restart|start)
+        TEST_SERVICE_ACTIVE=true
+        ;;
+      stop|disable)
+        TEST_SERVICE_ACTIVE=false
+        ;;
+    esac
+    return
+  fi
+  systemctl "$@"
+}
+
+print_service_diagnostics() {
+  if [ "$TEST_MODE" = true ]; then
+    record_command systemctl status shrinkray --no-pager -l
+    record_command journalctl -u shrinkray -n 100 --no-pager
+    return
+  fi
+  systemctl status shrinkray --no-pager -l >&2 || true
+  journalctl -u shrinkray -n 100 --no-pager >&2 || true
+}
+
+declare -a MANAGED_TARGETS=(
+  "$SHRINKRAY_BIN"
+  "$SERVER_BIN"
+  "$DOCTOR_BIN"
+  "$LAUNCHER_FILE"
+  "$CONFIG_FILE"
+  "$SERVICE_FILE"
+)
+declare -a BACKUP_EXISTED=()
+
+backup_managed_files() {
+  local index target
+  BACKUP_DIR="${TEMP_DIR}/managed-backup"
+  mkdir -m 0700 "$BACKUP_DIR"
+  BACKUP_EXISTED=()
+  for ((index = 0; index < ${#MANAGED_TARGETS[@]}; index++)); do
+    target="${MANAGED_TARGETS[index]}"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      cp -a -- "$target" "${BACKUP_DIR}/${index}"
+      BACKUP_EXISTED+=(true)
+    else
+      BACKUP_EXISTED+=(false)
+    fi
+  done
+  PREVIOUS_SERVICE_ACTIVE=false
+  if run_systemctl is-active --quiet shrinkray; then
+    PREVIOUS_SERVICE_ACTIVE=true
+  fi
+  if [ "$MANAGED_CONFIG_FOUND" = true ]; then
+    PREVIOUS_PORT="$EXISTING_PORT"
+  elif [ "$MANUAL_SERVICE_FOUND" = true ]; then
+    PREVIOUS_PORT="$MANUAL_PORT"
+  fi
+  say "Backed up existing managed files before replacement."
+}
+
+restore_managed_file() {
+  local backup="$1" target="$2" parent temporary
+  parent="$(dirname -- "$target")"
+  mkdir -p -- "$parent"
+  temporary="$(mktemp "${parent}/.shrinkray-rollback.XXXXXX")"
+  rm -f -- "$temporary"
+  cp -a -- "$backup" "$temporary"
+  mv -fT -- "$temporary" "$target"
+}
+
+verify_previous_health() {
+  [ "$PREVIOUS_SERVICE_ACTIVE" = true ] || return 0
+  [ -n "$PREVIOUS_PORT" ] || {
+    warn "Rollback restored the previous service, but its health port was not discoverable."
+    return 0
+  }
+  if [ "$TEST_MODE" = true ]; then
+    record_command curl --fail --silent --show-error "http://127.0.0.1:${PREVIOUS_PORT}/api/health"
+    return
+  fi
+  local health_file="${TEMP_DIR}/rollback-health.json"
+  for _ in $(seq 1 40); do
+    if curl --fail --silent --show-error "http://127.0.0.1:${PREVIOUS_PORT}/api/health" --output "$health_file" &&
+       grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' "$health_file"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  warn "The previous service was restarted, but its local health check failed."
+  return 1
+}
+
+rollback_installation() {
+  local index target
+  [ "$FILES_REPLACED" = true ] || return 0
+  ROLLBACK_IN_PROGRESS=true
+  warn "Installation failed after file replacement; rolling back."
+  run_systemctl stop shrinkray || true
+  for ((index = 0; index < ${#MANAGED_TARGETS[@]}; index++)); do
+    target="${MANAGED_TARGETS[index]}"
+    if [ "${BACKUP_EXISTED[index]:-false}" = true ]; then
+      restore_managed_file "${BACKUP_DIR}/${index}" "$target" || warn "Could not restore $target"
+    else
+      rm -f -- "$target" || warn "Could not remove newly installed file: $target"
+    fi
+  done
+  run_systemctl daemon-reload || true
+  if [ "$PREVIOUS_SERVICE_ACTIVE" = true ]; then
+    run_systemctl restart shrinkray || warn "Could not restart the previous shrinkray.service."
+    verify_previous_health || true
+  fi
+  FILES_REPLACED=false
+  ROLLBACK_IN_PROGRESS=false
+  warn "Rollback completed; state, media, and Tailscale configuration were not removed."
+}
+
 atomic_install() {
   local source="$1" target="$2" mode="$3" temporary
   temporary="$(mktemp "${target}.tmp.XXXXXX")"
-  if ! install -o root -g root -m "$mode" "$source" "$temporary"; then
+  if [ "$TEST_MODE" = true ]; then
+    if ! install -m "$mode" "$source" "$temporary"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+  elif ! install -o root -g root -m "$mode" "$source" "$temporary"; then
     rm -f -- "$temporary"
     return 1
   fi
@@ -876,48 +1152,67 @@ atomic_install() {
 
 install_managed_files() {
   local build_dir="${TEMP_DIR}/build"
-  install -d -o root -g root -m 0755 /usr/local/bin /usr/local/libexec "$CONFIG_DIR"
-  install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$STATE_DIR_DEFAULT"
-  if [ "$STATE_DIR" != "$STATE_DIR_DEFAULT" ]; then
-    install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$STATE_DIR"
+  if [ "$TEST_MODE" = true ]; then
+    install -d -m 0755 "$(dirname -- "$SHRINKRAY_BIN")" "$(dirname -- "$LAUNCHER_FILE")" "$CONFIG_DIR" "$(dirname -- "$SERVICE_FILE")"
+    install -d -m 0700 "$STATE_DIR_DEFAULT"
+    if [ "$STATE_DIR" != "$STATE_DIR_DEFAULT" ]; then
+      install -d -m 0700 "$STATE_DIR"
+    fi
+  else
+    install -d -o root -g root -m 0755 /usr/local/bin /usr/local/libexec "$CONFIG_DIR"
+    install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$STATE_DIR_DEFAULT"
+    if [ "$STATE_DIR" != "$STATE_DIR_DEFAULT" ]; then
+      install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$STATE_DIR"
+    fi
   fi
+  FILES_REPLACED=true
   atomic_install "${build_dir}/shrinkray" "$SHRINKRAY_BIN" 0755 || die "Could not install $SHRINKRAY_BIN atomically."
   atomic_install "${build_dir}/shrinkray-server" "$SERVER_BIN" 0755 || die "Could not install $SERVER_BIN atomically."
+  atomic_install "${build_dir}/shrinkray-server-doctor" "$DOCTOR_BIN" 0755 || die "Could not install $DOCTOR_BIN atomically."
   atomic_install "${TEMP_DIR}/server.conf" "$CONFIG_FILE" 0644 || die "Could not install $CONFIG_FILE atomically."
   atomic_install "${TEMP_DIR}/launcher" "$LAUNCHER_FILE" 0755 || die "Could not install $LAUNCHER_FILE atomically."
   atomic_install "${TEMP_DIR}/shrinkray.service" "$SERVICE_FILE" 0644 || die "Could not install $SERVICE_FILE atomically."
 }
 
-print_service_diagnostics() {
-  systemctl status shrinkray --no-pager -l >&2 || true
-  journalctl -u shrinkray -n 100 --no-pager >&2 || true
-}
-
 activate_and_verify() {
   local health_file="${TEMP_DIR}/health.json" label escaped
-	local was_active=false
-	if systemctl is-active --quiet shrinkray; then
-		was_active=true
-	fi
-  systemctl daemon-reload
-  if ! systemctl enable --now shrinkray; then
+	run_systemctl daemon-reload
+  if ! run_systemctl enable --now shrinkray; then
     print_service_diagnostics
     die "Could not enable and start shrinkray.service."
   fi
-	if [ "$was_active" = true ] && ! systemctl restart shrinkray; then
+	if [ "$PREVIOUS_SERVICE_ACTIVE" = true ] && ! run_systemctl restart shrinkray; then
 		print_service_diagnostics
 		die "Could not restart the updated shrinkray.service."
 	fi
-  if ! systemctl is-active --quiet shrinkray; then
+  if ! run_systemctl is-active --quiet shrinkray; then
     print_service_diagnostics
     die "shrinkray.service is not active."
   fi
+	if [ "$TEST_MODE" = true ]; then
+		{
+			printf '{"status":"ok","roots":['
+			local separator=""
+			for label in "${ROOT_LABELS[@]}"; do
+				escaped="${label//\\/\\\\}"
+				escaped="${escaped//\"/\\\"}"
+				escaped="${escaped//&/\\u0026}"
+				escaped="${escaped//</\\u003c}"
+				escaped="${escaped//>/\\u003e}"
+				printf '%s{"label":"%s"}' "$separator" "$escaped"
+				separator=,
+			done
+			printf ']}\n'
+		} > "$health_file"
+		record_command curl --fail --silent --show-error "http://127.0.0.1:${PORT}/api/health"
+	else
 	for _ in $(seq 1 40); do
     if curl --fail --silent --show-error "http://127.0.0.1:${PORT}/api/health" --output "$health_file"; then
       break
     fi
     sleep 0.25
   done
+	fi
   if [ ! -s "$health_file" ] || ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' "$health_file"; then
     print_service_diagnostics
     die "Local Shrinkray health check failed on 127.0.0.1:${PORT}."
@@ -935,25 +1230,328 @@ activate_and_verify() {
   done
 }
 
-tailscale_notice() {
+run_tailscale() {
+  record_command tailscale "$@"
+  if [ "$TEST_MODE" = true ]; then
+    if [ "${1-}" = status ] && [ "${2-}" = --json ]; then
+      printf '%s\n' "${SHRINKRAY_INSTALL_TEST_TAILSCALE_STATUS_JSON:-{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"test-host.example.ts.net.\"}}}"
+    elif [ "${1-}" = status ]; then
+      printf '%s\n' "${SHRINKRAY_INSTALL_TEST_TAILSCALE_STATUS:-100.64.0.1 test-host test@example linux active}"
+    elif [ "${1-}" = serve ] && [ "${2-}" = status ] && [ "${3-}" = --json ]; then
+      printf '%s\n' "${SHRINKRAY_INSTALL_TEST_TAILSCALE_SERVE_STATUS_JSON:-{}}"
+    elif [ "${1-}" = serve ] && [ "${2-}" = status ]; then
+      printf '%s\n' "${TEST_SERVE_STATUS:-No serve config}"
+    elif [ "${1-}" = serve ]; then
+      if [ "${*: -1}" = off ]; then
+        TEST_SERVE_STATUS="${SHRINKRAY_INSTALL_TEST_TAILSCALE_SERVE_STATUS_AFTER_OFF:-No serve config}"
+      else
+        TEST_SERVE_STATUS="${SHRINKRAY_INSTALL_TEST_TAILSCALE_SERVE_STATUS_AFTER_CONFIG:-https://test-host.example.ts.net:${TAILSCALE_HTTPS_PORT}/
+|-- / proxy http://127.0.0.1:${PORT}}"
+      fi
+    fi
+    return 0
+  fi
+  tailscale "$@"
+}
+
+run_ss() {
+  record_command ss "$@"
+  if [ "$TEST_MODE" = true ]; then
+    printf '%s\n' "${SHRINKRAY_INSTALL_TEST_SS_OUTPUT:-}"
+    return 0
+  fi
+  ss "$@"
+}
+
+ss_port_lines() {
+  local status="$1" port="$2"
+  printf '%s\n' "$status" | awk -v suffix=":${port}" '$4 ~ (suffix "$")'
+}
+
+serve_listener_exists() {
+  local status="$1" wanted_port="$2"
+  printf '%s\n' "$status" | awk -v wanted="$wanted_port" '
+    function get_port(line, host) {
+      host=line
+      sub(/^[[:space:]]*https:\/\//, "", host)
+      sub(/[[:space:]\/].*$/, "", host)
+      if (host ~ /:[0-9]+$/) {
+        sub(/^.*:/, "", host)
+        return host
+      }
+      return 443
+    }
+    /^[[:space:]]*https:\/\// && get_port($0) == wanted { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+serve_backend_at_port() {
+  local status="$1" wanted_port="$2" backend="$3"
+  printf '%s\n' "$status" | awk -v wanted="$wanted_port" -v backend="$backend" '
+    function get_port(line, host) {
+      host=line
+      sub(/^[[:space:]]*https:\/\//, "", host)
+      sub(/[[:space:]\/].*$/, "", host)
+      if (host ~ /:[0-9]+$/) {
+        sub(/^.*:/, "", host)
+        return host
+      }
+      return 443
+    }
+    /^[[:space:]]*https:\/\// { port=get_port($0); next }
+    port == wanted && index($0, backend) { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+serve_port_is_only_backend() {
+  local status="$1" wanted_port="$2" backend="$3"
+  printf '%s\n' "$status" | awk -v wanted="$wanted_port" -v backend="$backend" '
+    function get_port(line, host) {
+      host=line
+      sub(/^[[:space:]]*https:\/\//, "", host)
+      sub(/[[:space:]\/].*$/, "", host)
+      if (host ~ /:[0-9]+$/) {
+        sub(/^.*:/, "", host)
+        return host
+      }
+      return 443
+    }
+    /^[[:space:]]*https:\/\// { port=get_port($0); next }
+    port == wanted && /^[[:space:]]*\|--/ {
+      routes++
+      if (index($0, backend)) matches++
+    }
+    END { exit(routes == 1 && matches == 1 ? 0 : 1) }
+  '
+}
+
+print_port_conflict() {
+  local port="$1" serve_status="$2" ss_status="$3"
+  warn "Port $port is already occupied."
+  ss_port_lines "$ss_status" "$port" >&2 || true
+  if serve_listener_exists "$serve_status" "$port"; then
+    warn "Tailscale Serve listener on port $port:"
+    printf '%s\n' "$serve_status" >&2
+  fi
+}
+
+check_backend_port_before_install() {
+  local ss_status port_lines
+  ss_status="$(run_ss -ltnp 2>/dev/null)" || die "Could not inspect listening TCP ports with ss."
+  port_lines="$(ss_port_lines "$ss_status" "$PORT")"
+  [ -z "$port_lines" ] && return 0
+  if printf '%s\n' "$port_lines" | grep -Fq 'shrinkray-serve' && run_systemctl is-active --quiet shrinkray; then
+    say "Backend port $PORT is owned by the existing shrinkray-server process."
+    return 0
+  fi
+  warn "Backend port $PORT is already owned by another process:"
+  printf '%s\n' "$port_lines" >&2
+  die "Choose another backend with --port; Shrinkray did not replace the existing listener."
+}
+
+tailscale_is_installed() {
+  if [ "$TEST_MODE" = true ]; then
+    [ "${SHRINKRAY_INSTALL_TEST_TAILSCALE_INSTALLED:-1}" = 1 ]
+    return
+  fi
+  command -v tailscale >/dev/null 2>&1 && command -v tailscaled >/dev/null 2>&1
+}
+
+install_tailscale_if_missing() {
+  if tailscale_is_installed; then
+    say "Tailscale client and daemon are installed."
+    return
+  fi
+  if [ "$DRY_RUN" = true ]; then
+    say "Would install Tailscale from https://tailscale.com/install.sh."
+    return
+  fi
+  if [ "$TEST_MODE" = true ]; then
+    record_command curl -fsSL https://tailscale.com/install.sh '|' sh
+    say "Test mode: recorded Tailscale installation."
+    return
+  fi
+  say "Installing Tailscale using its official installer."
+  curl -fsSL https://tailscale.com/install.sh | sh
+  command -v tailscale >/dev/null 2>&1 || die "Tailscale installation did not provide the tailscale command."
+  command -v tailscaled >/dev/null 2>&1 || die "Tailscale installation did not provide the tailscaled daemon."
+}
+
+tailscale_connected() {
+  local json="$1"
+  printf '%s' "$json" | grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"'
+}
+
+tailscale_dns_name() {
+  local json="$1" name
+  name="$(printf '%s' "$json" | grep -Eom1 '"DNSName"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/^[^:]+:[[:space:]]*"([^"]+)"$/\1/')" || true
+  name="${name%.}"
+  if [[ "$name" =~ ^[A-Za-z0-9.-]+\.ts\.net$ ]]; then
+    printf '%s' "$name"
+  fi
+}
+
+inspect_tailscale_connection() {
+  local status_text status_json dns_name
+  status_text="$(run_tailscale status 2>&1)" || true
+  [ -z "$status_text" ] || printf '%s\n' "$status_text"
+  status_json="$(run_tailscale status --json 2>/dev/null)" || status_json=""
+  if ! tailscale_connected "$status_json"; then
+    if [ "$NON_INTERACTIVE" = true ]; then
+      die "Tailscale is not connected. Connect it before using --non-interactive, or use --skip-tailscale."
+    fi
+    say "Tailscale login is required. The next command will display an authentication URL and wait for login."
+    run_tailscale up || die "tailscale up did not complete successfully."
+    status_text="$(run_tailscale status 2>&1)" || true
+    [ -z "$status_text" ] || printf '%s\n' "$status_text"
+    status_json="$(run_tailscale status --json 2>/dev/null)" || status_json=""
+    tailscale_connected "$status_json" || die "Tailscale is still not connected after tailscale up."
+  fi
+  dns_name="$(tailscale_dns_name "$status_json")"
+  if [ -n "$dns_name" ]; then
+    if [ "$TAILSCALE_HTTPS_PORT" = 443 ]; then
+      DETECTED_TAILSCALE_URL="https://${dns_name}/"
+    else
+      DETECTED_TAILSCALE_URL="https://${dns_name}:${TAILSCALE_HTTPS_PORT}/"
+    fi
+  else
+    warn "Tailscale is connected, but its machine DNS name could not be read from status --json."
+  fi
+}
+
+configure_tailscale_serve() {
+  local backend="http://127.0.0.1:${PORT}" serve_status serve_json ss_status port_lines
+  local configured_correct=false old_443_route=false
   if [ "$SKIP_TAILSCALE" = true ]; then
     say "Tailscale handling skipped as requested."
     return
   fi
+  if [ "$DRY_RUN" = true ]; then
+    if ! tailscale_is_installed; then
+      say "Would install Tailscale from https://tailscale.com/install.sh."
+    fi
+    say "Would enable and start tailscaled.service."
+    say "Would inspect ports 443, $PORT, and $TAILSCALE_HTTPS_PORT with ss."
+    say "Would inspect Tailscale Serve text and JSON status."
+    say "Would preserve a matching route or configure HTTPS port $TAILSCALE_HTTPS_PORT for $backend when unoccupied."
+    say "Would migrate a clearly owned Shrinkray HTTPS 443 listener only after the new route is verified."
+    return
+  fi
+  install_tailscale_if_missing
+  run_systemctl enable --now tailscaled || die "Could not enable and start tailscaled.service."
+  inspect_tailscale_connection
+  if ! serve_status="$(run_tailscale serve status 2>&1)"; then
+    [ -z "$serve_status" ] || printf '%s\n' "$serve_status" >&2
+    die "Could not inspect the current Tailscale Serve configuration."
+  fi
+  if ! serve_json="$(run_tailscale serve status --json 2>&1)"; then
+    [ -z "$serve_json" ] || printf '%s\n' "$serve_json" >&2
+    die "Could not inspect the JSON Tailscale Serve configuration."
+  fi
+  [ -n "$serve_json" ] || warn "Tailscale Serve JSON status was empty."
+  ss_status="$(run_ss -ltnp 2>/dev/null)" || die "Could not inspect listening TCP ports with ss."
+  say "Current Tailscale Serve status:"
+  printf '%s\n' "$serve_status"
+
+  port_lines="$(ss_port_lines "$ss_status" 443)"
+  if [ -n "$port_lines" ] && printf '%s\n' "$port_lines" | grep -Fqi tailscaled; then
+    warn "Tailscale currently owns TCP port 443. This can block Coolify, Traefik, Caddy, Nginx, Apache, or another host reverse proxy."
+  fi
+
+  if serve_backend_at_port "$serve_status" "$TAILSCALE_HTTPS_PORT" "$backend"; then
+    configured_correct=true
+    say "Tailscale Serve already proxies HTTPS port $TAILSCALE_HTTPS_PORT to $backend; leaving that listener unchanged."
+  fi
+  if serve_backend_at_port "$serve_status" 443 "$backend"; then
+    old_443_route=true
+    warn "Found an old Shrinkray Tailscale Serve listener on HTTPS port 443."
+  elif serve_listener_exists "$serve_status" 443; then
+    warn "An unrelated Tailscale Serve listener uses port 443; Shrinkray will leave it untouched."
+  fi
+
+  if serve_listener_exists "$serve_status" "$TAILSCALE_HTTPS_PORT" && [ "$configured_correct" = false ]; then
+    print_port_conflict "$TAILSCALE_HTTPS_PORT" "$serve_status" "$ss_status"
+    die "Choose another unused port with --tailscale-https-port; the existing Serve listener was not replaced."
+  fi
+  port_lines="$(ss_port_lines "$ss_status" "$TAILSCALE_HTTPS_PORT")"
+  if [ -n "$port_lines" ]; then
+    if [ "$configured_correct" = false ] || ! printf '%s\n' "$port_lines" | grep -Fqi tailscaled; then
+      print_port_conflict "$TAILSCALE_HTTPS_PORT" "$serve_status" "$ss_status"
+      die "Choose another unused port with --tailscale-https-port; Shrinkray did not replace the existing listener."
+    fi
+  fi
+
   if [ "$FORCE_TAILSCALE" = true ]; then
-    warn "Core installer completed, but automatic Tailscale Serve reconfiguration is not implemented yet."
+    warn "--force-tailscale never overrides an occupied listener; ownership checks remain enforced."
+  fi
+
+  if [ "$configured_correct" = false ]; then
+    say "Configuring private Tailscale HTTPS port $TAILSCALE_HTTPS_PORT for $backend."
+    run_tailscale serve --https="$TAILSCALE_HTTPS_PORT" --bg --yes "$backend" || die "Could not configure the Shrinkray Tailscale Serve listener."
+    serve_status="$(run_tailscale serve status 2>&1)" || die "Could not verify Tailscale Serve after configuration."
+    serve_json="$(run_tailscale serve status --json 2>&1)" || die "Could not verify JSON Tailscale Serve status after configuration."
+    [ -n "$serve_json" ] || warn "Tailscale Serve JSON status was empty after configuration."
+    serve_backend_at_port "$serve_status" "$TAILSCALE_HTTPS_PORT" "$backend" || die "The new HTTPS port $TAILSCALE_HTTPS_PORT route did not appear in Tailscale Serve status."
+    say "Verified the new Shrinkray Tailscale Serve listener on HTTPS port $TAILSCALE_HTTPS_PORT."
+  fi
+
+  if [ "$old_443_route" = true ]; then
+    if serve_port_is_only_backend "$serve_status" 443 "$backend"; then
+      say "Removing only the old Shrinkray HTTPS port 443 listener after successful migration."
+      run_tailscale serve --https=443 off || die "The new listener is working, but the old Shrinkray HTTPS port 443 listener could not be removed."
+      serve_status="$(run_tailscale serve status 2>&1)" || die "Could not verify Tailscale Serve after removing the old port 443 listener."
+      run_tailscale serve status --json >/dev/null || die "Could not verify JSON Tailscale Serve status after removing the old port 443 listener."
+      if serve_backend_at_port "$serve_status" 443 "$backend"; then
+        die "The old Shrinkray HTTPS port 443 listener is still present after the targeted removal."
+      fi
+      say "Migrated Shrinkray from Tailscale HTTPS port 443 to $TAILSCALE_HTTPS_PORT."
+    else
+      warn "The port 443 listener also contains unknown routes, so Shrinkray left it untouched. Remove only the old Shrinkray route manually after reviewing 'tailscale serve status'."
+    fi
   else
-    say "Existing Tailscale Serve configuration was left unchanged."
+    say "Port 443 was not claimed or changed by Shrinkray."
   fi
-  if [ -n "$TAILSCALE_URL" ]; then
-    say "Expected private dashboard URL: $TAILSCALE_URL"
+}
+
+remote_health_check() {
+  local browser_url="$1" remote_health
+  [ -n "$browser_url" ] || return 0
+  remote_health="${browser_url%/}/api/health"
+  if [ "$TEST_MODE" = true ]; then
+    record_command curl --fail --silent --show-error --max-time 10 "$remote_health"
+    say "Test mode: recorded optional remote health check for $remote_health."
+  elif curl --fail --silent --show-error --max-time 10 "$remote_health" >/dev/null; then
+    say "Private HTTPS health check succeeded."
+  else
+    warn "Optional private HTTPS health check is not ready yet: $remote_health"
+    warn "The authoritative loopback health check passed; HTTPS certificates or MagicDNS may still be completing."
   fi
-  say "The internal service remains authoritative at http://127.0.0.1:${PORT}."
+}
+
+print_success() {
+  local browser_url="$DETECTED_TAILSCALE_URL"
+  [ -z "$TAILSCALE_URL" ] || browser_url="$TAILSCALE_URL"
+  printf '\nShrinkray is running.\n\n'
+  printf 'Local backend:\nhttp://127.0.0.1:%s\n' "$PORT"
+  if [ -n "$browser_url" ]; then
+    printf '\nPrivate HTTPS dashboard:\n%s\n' "$browser_url"
+  elif [ "$SKIP_TAILSCALE" = false ]; then
+    printf '\nPrivate HTTPS dashboard:\nUnavailable (machine DNS name was not detected)\n'
+  fi
+  printf '\nCoolify/reverse-proxy HTTPS remains available on:\nport 443\n'
+  printf '\nUseful commands:\n'
+  printf 'systemctl status shrinkray\n'
+  printf 'journalctl -u shrinkray -f\n'
+  printf 'tailscale serve status\n'
+  remote_health_check "$browser_url"
 }
 
 EXISTING_USER=""
 EXISTING_GROUP=""
 EXISTING_PORT=""
+EXISTING_TAILSCALE_HTTPS_PORT=""
 EXISTING_STATE_DIR=""
 MANUAL_USER=""
 MANUAL_GROUP=""
@@ -969,6 +1567,7 @@ select_service_user
 select_preserved_settings
 install_dependencies
 validate_roots
+check_backend_port_before_install
 prepare_source
 ensure_go
 build_and_validate
@@ -977,14 +1576,21 @@ write_launcher_candidate "${TEMP_DIR}/launcher"
 write_service_candidate "${TEMP_DIR}/shrinkray.service"
 
 if [ "$DRY_RUN" = true ]; then
+  configure_tailscale_serve
   say "Dry run complete; no system files or services were changed."
   say "Service user/group: ${SERVICE_USER}:${SERVICE_GROUP}"
   say "Loopback endpoint: http://127.0.0.1:${PORT}"
+  say "Private Tailscale HTTPS port: ${TAILSCALE_HTTPS_PORT} (port 443 remains reserved)"
   say "Validated ${#ROOT_PATHS[@]} media root(s)."
   exit 0
 fi
 
+backup_managed_files
 install_managed_files
 activate_and_verify
-tailscale_notice
-say "Shrinkray server installation complete."
+configure_tailscale_serve
+INSTALL_SUCCEEDED=true
+FILES_REPLACED=false
+rm -rf -- "$BACKUP_DIR"
+BACKUP_DIR=""
+print_success
